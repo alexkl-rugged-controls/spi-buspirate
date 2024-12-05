@@ -9,8 +9,8 @@
 
 int main(int argc, char *argv[]) {
     spi_t spi;
-    uint8_t buf[4] = { 0xaa, 0xbb, 0xcc, 0xdd };
-    int port = 509;
+    uint8_t buf[32] = {0};
+    int port = 0;
     char file[1000];
 
     if (argc == 2) {
@@ -22,7 +22,7 @@ int main(int argc, char *argv[]) {
 
     /* Open spidev1.0 with mode 0 and max speed 1MHz */
     snprintf(file, 1000, "/dev/spidev%i.0", port);
-    if (spi_open(&spi, file, 0, 1000000) < 0) {
+    if (spi_open(&spi, file, 0, 30000) < 0) {
         fprintf(stderr, "spi_open(): %s\n", spi_errmsg(&spi));
         exit(1);
     }

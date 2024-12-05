@@ -28,6 +28,7 @@
 #include <linux/ctype.h>
 #include <linux/delay.h>
 #include <linux/gpio.h>
+#include <linux/gpio/driver.h>
 #include <linux/kernel.h>
 #include <linux/kthread.h>
 #include <linux/module.h>
@@ -47,8 +48,8 @@
 
 #define ENABLESPI 1
 #define ENABLESPIDEV 1
-#define ENABLEGPIO 1
-// #define ENABLEDEBUGIO 1
+//#define ENABLEGPIO 1
+#define ENABLEDEBUGIO 1
 
 
 
@@ -98,7 +99,7 @@ struct bp {
     struct gpio_chip gpio_chip;
 #endif
 #ifdef ENABLESPI
-    struct spi_master *spi_master;
+    struct spi_controller *spi_controller;
     char spi_name[32];
 #ifdef ENABLESPIDEV
     struct spi_device *spi_device;
@@ -130,12 +131,11 @@ static void rx_timout_reset(struct bp *bp) {
     mod_timer(&bp->rx_timer, jiffies + msecs_to_jiffies(RXTIMEOUTMS));
 }
 
-static void rx_timeout_callback(unsigned long data) {
-    struct bp *bp = (struct bp*)data;
+static void rx_timeout_callback(struct timer_list *timer) {
+    struct bp *bp = from_timer(bp, timer, rx_timer);
     atomic_set(&bp->rx_timeout, 1);
     wake_up(&bp->rx_queue);
 }
-
 
 
 /* ------ TX & RX ------ */
@@ -223,24 +223,28 @@ static void bp_io_rx_get(struct bp *bp, char *buffer, int len) /* Get RX data fr
 
 /* ------  SPI callbacks ------ */
 
-
+int bp_spi_transfer_one(struct spi_controller *controller, struct spi_device *spi, struct spi_transfer *transfer);
 
 #ifdef ENABLESPI
-int bp_spi_transfer_one(struct spi_master *master, struct spi_device *spi, struct spi_transfer *transfer)
+int bp_spi_transfer_one(struct spi_controller *controller, struct spi_device *spi, struct spi_transfer *transfer)
 {
     struct bp *bp;
     int err, i;
-    char buffer[10];
+    char buffer[128];
     const char *tx_buf;
     char *rx_buf;
     char s[50];
 
-    bp = (struct bp *)spi_master_get_devdata(master);
+    bp = (struct bp *)spi_controller_get_devdata(controller);
     tx_buf = transfer->tx_buf;
     rx_buf = transfer->rx_buf;
     pr_debug("(%s) spi_transfer_one (len:%d tx_nbits:%d rx_nbits:%d)", bp->tty->name, transfer->len, transfer->tx_nbits, transfer->rx_nbits);
-    snprintf(s, 50, "BPSpi: (%s) spi_transfer_one: -> ", bp->tty->name);
-    print_hex_dump(KERN_DEBUG, s, DUMP_PREFIX_NONE, 16, 8, tx_buf, transfer->len, true);
+
+    if (transfer->tx_nbits > 0) {
+        snprintf(s, 50, "BPSpi: (%s) spi_transfer_one: -> ", bp->tty->name);
+        print_hex_dump(KERN_DEBUG, s, DUMP_PREFIX_NONE, 16, 8, tx_buf, transfer->len, true);
+    }
+
     mutex_lock(&bp->busy);
     if (atomic_read(&bp->status) > BPSPI_STATE_OK) {
         mutex_unlock(&bp->busy);
@@ -252,14 +256,23 @@ int bp_spi_transfer_one(struct spi_master *master, struct spi_device *spi, struc
         BP_TX_CHAR(bp, 0x10);
         BP_RX(bp, 1);
         BP_RX_GET_AND_MEMCMP(bp, "\x01", 1);
-        BP_TX_CHAR(bp, tx_buf[i]);
+        if (transfer->tx_nbits > 0) {
+            BP_TX_CHAR(bp, tx_buf[i]);
+        } else {
+            BP_TX_CHAR(bp, 0);
+        }
         BP_RX(bp, 1);
         bp_io_rx_get(bp, buffer, 1);
-        rx_buf[i] = buffer[0];
+        if (transfer->rx_nbits > 0) {
+            rx_buf[i] = buffer[0];
+        }
     }
     mutex_unlock(&bp->busy);
-    snprintf(s, 50, "BPSpi: (%s) spi_transfer_one: <- ", bp->tty->name);
-    print_hex_dump(KERN_DEBUG, s, DUMP_PREFIX_NONE, 16, 8, rx_buf, transfer->len, true);
+
+    if (transfer->rx_nbits > 0) {
+        snprintf(s, 50, "BPSpi: (%s) spi_transfer_one: <- ", bp->tty->name);
+        print_hex_dump(KERN_DEBUG, s, DUMP_PREFIX_NONE, 16, 8, rx_buf, transfer->len, true);
+    }
     return 0;
 
 fail:
@@ -277,7 +290,7 @@ static int bp_spi_setup(struct spi_device *spi)
     struct bp *bp;
     int err;
 
-    bp = spi_master_get_devdata(spi->master);
+    bp = spi_controller_get_devdata(spi->controller);
     mutex_lock(&bp->busy);
     if (atomic_read(&bp->status) > BPSPI_STATE_OK) {
         pr_debug("(%s) bp_spi_setup aborted\n", bp->tty->name);
@@ -291,9 +304,9 @@ static int bp_spi_setup(struct spi_device *spi)
         clear_bit(2, &bp->SPIconfig);
     }
     if (spi->mode & SPI_CPOL) {
-        set_bit(1, &bp->SPIconfig);
-    } else {
         clear_bit(1, &bp->SPIconfig);
+    } else {
+        set_bit(1, &bp->SPIconfig);
     }
     pr_debug("(%s) bp_spi_setup(val:%x SPIconfig reg:%lx)\n", bp->tty->name, spi->mode, bp->SPIconfig);
 
@@ -314,6 +327,52 @@ fail:
     return -1;
 }
 #endif
+
+
+
+static void bp_spi_set_cs(struct spi_device *spi, bool enable) {
+    struct bp *bp;
+    int err;
+    pr_debug("set cs: %d\n", enable);
+    bp = spi_controller_get_devdata(spi->controller);
+    mutex_lock(&bp->busy);
+    BP_TX_CHAR(bp, enable?0x02:0x03);
+    BP_RX(bp, 1);
+    BP_RX_GET_AND_MEMCMP(bp, "\x01", 1);
+fail:
+    mutex_unlock(&bp->busy);
+    pr_debug("set cs done: %d\n", enable);
+}
+
+
+static int bp_spi_prepare_message(struct spi_controller *controller, struct spi_message *msg) {
+    struct bp *bp;
+    int err;
+    pr_debug("prepare message\n");
+    bp = spi_controller_get_devdata(controller);
+    mutex_lock(&bp->busy);
+    BP_TX_CHAR(bp, 0x02);
+    BP_RX(bp, 1);
+    BP_RX_GET_AND_MEMCMP(bp, "\x01", 1);
+fail:
+    mutex_unlock(&bp->busy);
+    return 0;
+}
+
+
+static int bp_spi_unprepare_message(struct spi_controller *controller, struct spi_message *msg) {
+    struct bp *bp;
+    int err;
+    pr_debug("unprepare message\n");
+    bp = spi_controller_get_devdata(controller);
+    mutex_lock(&bp->busy);
+    BP_TX_CHAR(bp, 0x03);
+    BP_RX(bp, 1);
+    BP_RX_GET_AND_MEMCMP(bp, "\x01", 1);
+fail:
+    mutex_unlock(&bp->busy);
+    return 0;
+}
 
 
 /* ------ GPIO callbacks ------ */
@@ -411,7 +470,7 @@ static int bp_gpio_direction_input(struct gpio_chip *gc, unsigned offset)
 
 
 static void static_kobj_release(struct kobject *kobj)
-{ 
+{
     pr_info("(%s) kobj realeased\n", kobj->name);
 }
 
@@ -485,7 +544,7 @@ static struct kobj_attribute pwr_attribute = __ATTR_RO(pwr);
 static ssize_t spi_show(struct kobject * kobj, struct kobj_attribute * attr, char * buf)
 {
     struct bp *bp = container_of(kobj , struct bp, kobj);
-    return scnprintf(buf, PAGE_SIZE, "%i",  bp->spi_master->bus_num);
+    return scnprintf(buf, PAGE_SIZE, "%i",  bp->spi_controller->bus_num);
 }
 
 static struct kobj_attribute spi_attribute = __ATTR_RO(spi);
@@ -580,7 +639,7 @@ static const struct attribute *attrs2[] =
 
 
 
-static void __bp_dev_remove(struct bp *bp) /* Remove spi_master, spi_device, gpio_chip */
+static void __bp_dev_remove(struct bp *bp) /* Remove spi_controller, spi_device, gpio_chip */
 {
     sysfs_remove_files(&bp->kobj, attrs2);
 #ifdef ENABLESPI
@@ -588,7 +647,7 @@ static void __bp_dev_remove(struct bp *bp) /* Remove spi_master, spi_device, gpi
     spi_unregister_device(bp->spi_device);
 #endif
     sysfs_remove_link(&bp->kobj, bp->spi_name);
-    spi_unregister_master(bp->spi_master);
+    spi_unregister_controller(bp->spi_controller);
 #endif
 #ifdef ENABLEGPIO
 #if LINUX_VERSION_CODE <= KERNEL_VERSION(3,17,8)
@@ -599,7 +658,7 @@ static void __bp_dev_remove(struct bp *bp) /* Remove spi_master, spi_device, gpi
 #endif
 };
 
-static int __bp_dev_add(struct bp *bp) /* Create spi_master, spi_device, gpio_chip */
+static int __bp_dev_add(struct bp *bp) /* Create spi_controller, spi_device, gpio_chip */
 {
     int rc;
 
@@ -619,46 +678,56 @@ static int __bp_dev_add(struct bp *bp) /* Create spi_master, spi_device, gpio_ch
     bp->gpio_chip.can_sleep = true;
     bp->gpio_chip.ngpio = 3;
     bp->gpio_chip.base = gpio_base;
-    if ((rc = gpiochip_add(&bp->gpio_chip))) {
-        pr_err("(%s) gpiochip_add failed (rc = %d)\n", bp->tty->name, rc);
+    if ((rc = gpiochip_add_data(&bp->gpio_chip, bp))) {
+        pr_err("(%s) gpiochip_add_data failed (rc = %d)\n", bp->tty->name, rc);
         return -1;
     }
 #endif
 
-    /* ------ spi_master create ------ */
+    /* ------ spi_controller create ------ */
 #ifdef ENABLESPI
-    bp->spi_master = spi_alloc_master(bp->tty->dev, 0);
-    if (!bp->spi_master) {
-        pr_err("(%s) spi_alloc_master failed\n", bp->tty->name);
+    bp->spi_controller = spi_alloc_host(bp->tty->dev, 0);
+    if (!bp->spi_controller) {
+        pr_err("(%s) spi_alloc_host failed\n", bp->tty->name);
         goto remove_gpio;
     }
-    spi_master_set_devdata(bp->spi_master, bp);
-    bp->spi_master->bus_num = spi_base;
-    bp->spi_master->bits_per_word_mask = SPI_BIT_MASK(8);
-    bp->spi_master->mode_bits = SPI_CPHA | SPI_CPOL;
-    bp->spi_master->transfer_one = bp_spi_transfer_one;
-    bp->spi_master->setup =  bp_spi_setup;
-    bp->spi_master->min_speed_hz = 30000;
-    bp->spi_master->max_speed_hz = 8000000;
-    if ((rc = spi_register_master(bp->spi_master))) {
-        pr_err("(%s) spi_register_master failed (rc = %d)\n", bp->tty->name, rc);
-        spi_master_put(bp->spi_master);
+    spi_controller_set_devdata(bp->spi_controller, bp);
+    bp->spi_controller->bus_num = spi_base;
+    bp->spi_controller->bits_per_word_mask = SPI_BPW_MASK(8);
+    bp->spi_controller->mode_bits = SPI_CPHA | SPI_CPOL;
+    bp->spi_controller->transfer_one = bp_spi_transfer_one;
+    bp->spi_controller->prepare_message = bp_spi_prepare_message;
+    bp->spi_controller->unprepare_message = bp_spi_unprepare_message;
+    bp->spi_controller->setup =  bp_spi_setup;
+    //bp->spi_controller->set_cs = bp_spi_set_cs;
+    bp->spi_controller->min_speed_hz = 30000;
+    bp->spi_controller->max_speed_hz = 8000000;
+    bp->spi_controller->use_gpio_descriptors = false;
+
+    if ((rc = spi_register_controller(bp->spi_controller))) {
+        pr_err("(%s) spi_register_controller failed (rc = %d)\n", bp->tty->name, rc);
+        spi_controller_put(bp->spi_controller);
         goto remove_gpio;
     }
-    scnprintf(bp->spi_name, 32, "%s",  dev_name(&bp->spi_master->dev));
-    if((rc = sysfs_create_link(&bp->kobj, &bp->spi_master->dev.kobj, bp->spi_name))) {
+    scnprintf(bp->spi_name, 32, "%s",  dev_name(&bp->spi_controller->dev));
+    if((rc = sysfs_create_link(&bp->kobj, &bp->spi_controller->dev.kobj, bp->spi_name))) {
         pr_err("(%s) sysfs_create_link failed (rc = %d)\n", bp->tty->name, rc);
-        spi_unregister_master(bp->spi_master);
+        spi_unregister_controller(bp->spi_controller);
         goto remove_gpio;
     }
 
     /* ------ spi_device create ------ */
 #ifdef ENABLESPIDEV
-    bp->spi_device = spi_alloc_device(bp->spi_master);
+    bp->spi_device = spi_alloc_device(bp->spi_controller);
     if (!bp->spi_device) {
         pr_err("(%s) spi_alloc_device failed\n", bp->tty->name);
         goto remove_spi;
     }
+
+	for (int idx = 0; idx < SPI_CS_CNT_MAX; idx++)
+		spi_set_chipselect(bp->spi_device, idx, 0xFF);
+	spi_set_chipselect(bp->spi_device, 0, 0);
+
     snprintf(bp->spi_device->modalias, SPI_NAME_SIZE, "spidev");
     if ((rc = spi_add_device(bp->spi_device))) {
         pr_err("(%s) spi_add_device failed (rc = %d)\n", bp->tty->name, rc);
@@ -680,7 +749,7 @@ static int __bp_dev_add(struct bp *bp) /* Create spi_master, spi_device, gpio_ch
 #ifdef ENABLESPIDEV
     pr_info("(%s) spi_device added: %s\n", bp->tty->name, dev_name(&bp->spi_device->dev));
 #endif
-    pr_info("(%s) spi_master added: spi%u\n", bp->tty->name, bp->spi_master->bus_num);
+    pr_info("(%s) spi_controller added: spi%u\n", bp->tty->name, bp->spi_controller->bus_num);
 #endif
 #ifdef ENABLEGPIO
     pr_info("(%s) gpiochip added: pins %d to %d\n", bp->tty->name, bp->gpio_chip.base, bp->gpio_chip.base + 2);
@@ -695,7 +764,7 @@ remove_spidev:
 remove_spi:
 #ifdef ENABLESPI
     sysfs_remove_link(&bp->kobj, bp->spi_name);
-    spi_unregister_master(bp->spi_master);
+    spi_unregister_controller(bp->spi_controller);
 #endif
 remove_gpio:
 #ifdef ENABLEGPIO
@@ -797,14 +866,12 @@ static int thread_function(void *data) /* Management thread */
 
     __bp_dev_remove(bp);
     pr_debug("(%s) mngt task: stopped!\n", bp->tty->name);
-    do_exit(0);
     return 0;
 
 fail:
     pr_debug("(%s) mngt task: aborted\n", bp->tty->name);
     atomic_set(&bp->status, BPSPI_STATE_ERROR);
     wake_up(&bp->status_queue);
-    do_exit(-1);
     return -1;
 }
 
@@ -814,10 +881,10 @@ fail:
 
 
 
-static void bp_ldisc_receive(struct tty_struct *tty, const unsigned char *rx_buf, char *fp, int count) /* Receive data from BP */
+static void bp_ldisc_receive(struct tty_struct *tty, const unsigned char *rx_buf, const unsigned char *fp, size_t count)
 {
     struct bp *bp = tty->disc_data;
-    int l;
+    size_t l;
 
     if (unlikely(!bp)) {
         pr_err("(%s) ldisc_receive aborted\n", bp->tty->name);
@@ -829,7 +896,7 @@ static void bp_ldisc_receive(struct tty_struct *tty, const unsigned char *rx_buf
     snprintf(s, 50, "BPSpi: (%s) <- ", tty->name);
     print_hex_dump(KERN_DEBUG, s, DUMP_PREFIX_NONE, 16, 8, rx_buf, count, true);
 #endif
-    l = min(count, RXBUFFERSIZE - atomic_read(&bp->rx_len));
+    l = min(count, (size_t)RXBUFFERSIZE - atomic_read(&bp->rx_len));
     if (l != count) {
         pr_err("(%s) ldisc_receive overflow\n", bp->tty->name);
     }
@@ -902,8 +969,8 @@ static int bp_ldisc_open(struct tty_struct *tty)
     atomic_set(&bp->status, BPSPI_STATE_STARTING);
     mutex_init(&bp->busy);
     init_waitqueue_head(&bp->status_queue);
-    bp->BPconfig = 0x00; /* Configure peripherals w=power, x=pull-ups, y=AUX, z=CS */
-    bp->SPIconfig = 0x02; /* SPI config, w=HiZ/3.3v, x=CKP idle, y=CKE edge, z=SMP sample */
+    bp->BPconfig = 0x08; /* Configure peripherals w=power, x=pull-ups, y=AUX, z=CS */
+    bp->SPIconfig = 0x0c; /* SPI config, w=HiZ/3.3v, x=CKP idle, y=CKE edge, z=SMP sample */
     bp->SPISpeedconfig = 0x00; /* SPI speed 000=30kHz, 001=125kHz, 010=250kHz, 011=1MHz, 100=2MHz, 101=2.6MHz,  110=4MHz, 111=8MHz */
 
     /* ------ RX variables setup ------ */
@@ -911,21 +978,21 @@ static int bp_ldisc_open(struct tty_struct *tty)
     sema_init(&bp->rx_semaphore, 1);
     atomic_set(&bp->rx_len, 0);
     atomic_set(&bp->rx_timeout, 0);
-    setup_timer(&bp->rx_timer, rx_timeout_callback, (unsigned long)(bp));
+    timer_setup(&bp->rx_timer, rx_timeout_callback, 0);
 
     /* ------ TTY setup ------ */
     down_write(&tty->termios_rwsem);
-    pr_debug("(%s) termios o:%d i:%d i:%x o:%x c:%x l:%x\n", tty->name, tty_termios_baud_rate(&tty->termios), tty_termios_input_baud_rate(&tty->termios), tty->termios.c_iflag, tty->termios.c_oflag, tty->termios.c_cflag, tty->termios.c_lflag);
+    pr_debug("(%s) termios o:%d i:%x o:%x c:%x l:%x\n", tty->name, tty_termios_baud_rate(&tty->termios), tty->termios.c_iflag, tty->termios.c_oflag, tty->termios.c_cflag, tty->termios.c_lflag);
     up_write(&tty->termios_rwsem);
     ktermios = tty->termios;
     ktermios.c_iflag = 0;
     ktermios.c_oflag = 0;
-    ktermios.c_cflag = 0x800018b2; /* Magic! */
+    ktermios.c_cflag = B115200 | CS8 | CLOCAL | CREAD;
     ktermios.c_lflag = 0;
     tty_set_termios(tty, &ktermios);
     down_write(&tty->termios_rwsem);
     tty_termios_encode_baud_rate(&tty->termios, 115200, 115200);
-    pr_debug("(%s) termios o:%d i:%d i:%x o:%x c:%x l:%x\n", tty->name, tty_termios_baud_rate(&tty->termios), tty_termios_input_baud_rate(&tty->termios), tty->termios.c_iflag, tty->termios.c_oflag, tty->termios.c_cflag, tty->termios.c_lflag);
+    pr_debug("(%s) termios o:%d i:%x o:%x c:%x l:%x\n", tty->name, tty_termios_baud_rate(&tty->termios), tty->termios.c_iflag, tty->termios.c_oflag, tty->termios.c_cflag, tty->termios.c_lflag);
     up_write(&tty->termios_rwsem);
     tty->receive_room = 65536;
     tty_driver_flush_buffer(tty);
@@ -980,23 +1047,23 @@ static void bp_ldisc_close(struct tty_struct *tty)
     }
 };
 
-static int bp_ldisc_ioctl(struct tty_struct *tty, struct file *file, unsigned int cmd, unsigned long arg)
+
+static int bp_ldisc_ioctl(struct tty_struct *tty, unsigned int cmd, unsigned long arg)
 {
     pr_debug("(%s) ldisc_ioctl: %x\n", tty->name, cmd);
     return 0;
 }
 
-static int bp_ldisc_hangup(struct tty_struct *tty)
+static void bp_ldisc_hangup(struct tty_struct *tty)
 {
     pr_debug("(%s) ldisc_hangup\n", tty->name);
     bp_ldisc_close(tty);
-    return 0;
 }
 
 static struct tty_ldisc_ops bp_ldisc = {
     .owner = THIS_MODULE,
-    .magic = TTY_LDISC_MAGIC,
     .name = "buspirate_spi",
+    .num  = N_GIGASET_M101,
     .open = bp_ldisc_open, /* This function is called when the line discipline is associated */
     .close = bp_ldisc_close, /* This function is called when the line discipline is being shutdown */
     .hangup = bp_ldisc_hangup, /* Called on a hangup. Tells the discipline that it should cease I/O to the tty driver */
@@ -1030,7 +1097,7 @@ static int __init buspirate_module_init(void)
         pr_err("kobject_init_and_add failed (rc = %d)\n", rc);
         return -ENOMEM;
     }
-    if ((rc = tty_register_ldisc(N_GIGASET_M101, &bp_ldisc))) {
+    if ((rc = tty_register_ldisc(&bp_ldisc))) {
         pr_err("module tty_register_ldisc failed (rc = %d)\n", rc);
     } else {
         pr_info("module loaded\n");
@@ -1040,13 +1107,7 @@ static int __init buspirate_module_init(void)
 
 static void __exit buspirate_module_cleanup(void)
 {
-    int rc;
-
-    if ((rc = tty_unregister_ldisc(N_GIGASET_M101))) {
-        pr_err("can't unregister line discipline (rc = %d)\n", rc);
-    } else {
-        pr_info("module unloaded\n");
-    }
+    tty_unregister_ldisc(&bp_ldisc);
     kobject_del(&module_kobj);
     kobject_put(&module_kobj);
 }
